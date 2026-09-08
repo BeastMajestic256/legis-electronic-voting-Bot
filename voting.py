@@ -10,6 +10,7 @@ from discord.ext import commands
 
 from database import Database
 
+import aiohttp
 
 VALID_VOTES = {
     "Yea",
@@ -925,27 +926,30 @@ class VotingSystem:
                         ),
                     )
 
-                except discord.NotFound:
+                except aiohttp.client_exceptions.ServerDisconnectedError:
+                    print(
+                        f"[Vote {vote_id}] "
+                        f"Discord connection closed during "
+                        f"countdown update."
+                    )
+                    return
 
+                except discord.NotFound:
                     print(
                         f"[Vote {vote_id}] "
                         f"Original message disappeared "
                         f"during countdown update."
                     )
-
                     return
 
                 except discord.Forbidden:
-
                     print(
                         f"[Vote {vote_id}] "
                         f"Lost access during countdown update."
                     )
-
                     return
 
                 except discord.HTTPException as exc:
-
                     print(
                         f"[Vote {vote_id}] "
                         f"Countdown update failed: "
@@ -959,7 +963,7 @@ class VotingSystem:
                 if remaining <= 60:
                     await asyncio.sleep(1)
                 else:
-                    await asyncio.sleep(2)
+                    await asyncio.sleep(1)
 
         except asyncio.CancelledError:
             raise
