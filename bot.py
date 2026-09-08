@@ -3,13 +3,13 @@ from discord.ext import commands
 
 import config
 import voting
+from database import Database
 
 
 class LegislativeBot(commands.Bot):
     def __init__(self) -> None:
         intents = discord.Intents.default()
 
-        # Required for discovering server members and roles.
         intents.members = True
 
         super().__init__(
@@ -17,13 +17,16 @@ class LegislativeBot(commands.Bot):
             intents=intents,
         )
 
-        # Make configuration available to command modules.
         self.config = config
 
-    async def setup_hook(self) -> None:
-        await voting.register(self)
+        self.database = Database()
 
-        # Synchronize slash commands with Discord.
+    async def setup_hook(self) -> None:
+        await voting.register(
+            self,
+            self.database,
+        )
+
         await self.tree.sync()
 
     async def on_ready(self) -> None:
@@ -31,7 +34,9 @@ class LegislativeBot(commands.Bot):
             f"Logged in as {self.user} "
             f"(ID: {self.user.id})"
         )
-        print("Legislative voting bot is online.")
+        print(
+            "Legislative voting bot is online."
+        )
 
 
 bot = LegislativeBot()
