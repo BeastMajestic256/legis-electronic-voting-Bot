@@ -17,7 +17,7 @@ The bot is intended to support voting on the legislative procedures established 
 
 ## Keys and Required Assets
 
-Create a `.env` for use as an environment variable. The file `env_example.txt` is given as a template.
+Create a `.env` for use as an environment variable. The file `.env.example` is given as a template.
 
 The exact Discord IDs are configurable and should not be hard-coded into the repository where avoidable.
 
