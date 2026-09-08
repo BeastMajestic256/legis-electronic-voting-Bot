@@ -32,10 +32,9 @@ class Database:
         self.connection.row_factory = sqlite3.Row
 
         self._create_tables()
+        self._migrate()
 
     def _create_tables(self) -> None:
-        """Create the database schema if it does not already exist."""
-
         cursor = self.connection.cursor()
 
         cursor.execute(
@@ -45,6 +44,8 @@ class Database:
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER NOT NULL,
                 message_id INTEGER,
+                creator_id INTEGER NOT NULL DEFAULT 0,
+                role_id INTEGER,
                 measure TEXT NOT NULL,
                 title TEXT NOT NULL,
                 duration_minutes INTEGER NOT NULL,
@@ -90,23 +91,59 @@ class Database:
 
         self.connection.commit()
 
+    def _migrate(self) -> None:
+        """
+        Add columns introduced after the original schema.
+
+        SQLite does not modify an existing table when
+        CREATE TABLE IF NOT EXISTS is called, so we explicitly
+        add missing columns here.
+        """
+
+        cursor = self.connection.cursor()
+
+        cursor.execute("PRAGMA table_info(votes)")
+        columns = {
+            row["name"]
+            for row in cursor.fetchall()
+        }
+
+        if "creator_id" not in columns:
+            cursor.execute(
+                """
+                ALTER TABLE votes
+                ADD COLUMN creator_id INTEGER NOT NULL DEFAULT 0
+                """
+            )
+
+        if "role_id" not in columns:
+            cursor.execute(
+                """
+                ALTER TABLE votes
+                ADD COLUMN role_id INTEGER
+                """
+            )
+
+        self.connection.commit()
+
     @staticmethod
     def now_iso() -> str:
-        """Return the current UTC time in ISO 8601 format."""
-
-        return datetime.now(timezone.utc).isoformat()
+        return datetime.now(
+            timezone.utc
+        ).isoformat()
 
     def create_vote(
         self,
         guild_id: int,
         channel_id: int,
+        creator_id: int,
+        role_id: Optional[int],
         measure: str,
         title: str,
         duration_minutes: int,
         opened_at: datetime,
         closes_at: datetime,
     ) -> int:
-        """Create a vote and return its database ID."""
 
         cursor = self.connection.cursor()
 
@@ -115,17 +152,21 @@ class Database:
             INSERT INTO votes (
                 guild_id,
                 channel_id,
+                creator_id,
+                role_id,
                 measure,
                 title,
                 duration_minutes,
                 opened_at,
                 closes_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id,
                 channel_id,
+                creator_id,
+                role_id,
                 measure,
                 title,
                 duration_minutes,
@@ -143,7 +184,6 @@ class Database:
         vote_id: int,
         message_id: int,
     ) -> None:
-        """Associate the Discord message with a vote."""
 
         self.connection.execute(
             """
@@ -161,7 +201,6 @@ class Database:
         vote_id: int,
         member_id: int,
     ) -> None:
-        """Add a voter with the default NV status."""
 
         self.connection.execute(
             """
@@ -172,7 +211,10 @@ class Database:
             )
             VALUES (?, ?, 'NV')
             """,
-            (vote_id, member_id),
+            (
+                vote_id,
+                member_id,
+            ),
         )
 
         self.connection.commit()
@@ -182,6 +224,7 @@ class Database:
         vote_id: int,
         member_id: int,
     ) -> Optional[str]:
+
         cursor = self.connection.execute(
             """
             SELECT vote
@@ -189,7 +232,10 @@ class Database:
             WHERE vote_id = ?
               AND member_id = ?
             """,
-            (vote_id, member_id),
+            (
+                vote_id,
+                member_id,
+            ),
         )
 
         row = cursor.fetchone()
@@ -205,7 +251,6 @@ class Database:
         member_id: int,
         new_vote: str,
     ) -> None:
-        """Update a vote and create an audit event."""
 
         old_vote = self.get_voter_vote(
             vote_id,
@@ -257,7 +302,6 @@ class Database:
         self,
         vote_id: int,
     ) -> None:
-        """Mark a vote as closed."""
 
         self.connection.execute(
             """
@@ -274,6 +318,7 @@ class Database:
         self,
         vote_id: int,
     ) -> Optional[sqlite3.Row]:
+
         cursor = self.connection.execute(
             """
             SELECT *
@@ -289,6 +334,7 @@ class Database:
         self,
         vote_id: int,
     ) -> list[sqlite3.Row]:
+
         cursor = self.connection.execute(
             """
             SELECT member_id, vote
@@ -301,7 +347,54 @@ class Database:
 
         return list(cursor.fetchall())
 
-    def close(self) -> None:
-        """Close the database connection."""
+    def get_vote_events(
+        self,
+        vote_id: int,
+    ) -> list[sqlite3.Row]:
 
+        cursor = self.connection.execute(
+            """
+            SELECT *
+            FROM vote_events
+            WHERE vote_id = ?
+            ORDER BY id
+            """,
+            (vote_id,),
+        )
+
+        return list(cursor.fetchall())
+
+    def get_recent_votes(
+        self,
+        limit: int = 10,
+    ) -> list[sqlite3.Row]:
+
+        cursor = self.connection.execute(
+            """
+            SELECT *
+            FROM votes
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (limit,),
+        )
+
+        return list(cursor.fetchall())
+
+    def get_open_votes(
+        self,
+    ) -> list[sqlite3.Row]:
+
+        cursor = self.connection.execute(
+            """
+            SELECT *
+            FROM votes
+            WHERE closed = 0
+            ORDER BY id DESC
+            """
+        )
+
+        return list(cursor.fetchall())
+
+    def close(self) -> None:
         self.connection.close()
