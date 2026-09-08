@@ -46,45 +46,19 @@ class Database:
                 message_id INTEGER,
                 creator_id INTEGER NOT NULL DEFAULT 0,
                 role_id INTEGER,
+
                 measure TEXT NOT NULL,
                 title TEXT NOT NULL,
+
                 duration_minutes INTEGER NOT NULL,
+
+                decisive INTEGER NOT NULL DEFAULT 1,
+                threshold TEXT NOT NULL DEFAULT 'majority',
+                result TEXT,
+
                 opened_at TEXT NOT NULL,
                 closes_at TEXT NOT NULL,
                 closed INTEGER NOT NULL DEFAULT 0
-            )
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS voters (
-                vote_id INTEGER NOT NULL,
-                member_id INTEGER NOT NULL,
-                vote TEXT NOT NULL DEFAULT 'NV',
-
-                PRIMARY KEY (vote_id, member_id),
-
-                FOREIGN KEY (vote_id)
-                    REFERENCES votes(id)
-                    ON DELETE CASCADE
-            )
-            """
-        )
-
-        cursor.execute(
-            """
-            CREATE TABLE IF NOT EXISTS vote_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                vote_id INTEGER NOT NULL,
-                member_id INTEGER NOT NULL,
-                old_vote TEXT,
-                new_vote TEXT NOT NULL,
-                changed_at TEXT NOT NULL,
-
-                FOREIGN KEY (vote_id)
-                    REFERENCES votes(id)
-                    ON DELETE CASCADE
             )
             """
         )
@@ -95,14 +69,13 @@ class Database:
         """
         Add columns introduced after the original schema.
 
-        SQLite does not modify an existing table when
-        CREATE TABLE IF NOT EXISTS is called, so we explicitly
-        add missing columns here.
+        Existing vote records are preserved.
         """
 
         cursor = self.connection.cursor()
 
         cursor.execute("PRAGMA table_info(votes)")
+
         columns = {
             row["name"]
             for row in cursor.fetchall()
@@ -124,6 +97,30 @@ class Database:
                 """
             )
 
+        if "decisive" not in columns:
+            cursor.execute(
+                """
+                ALTER TABLE votes
+                ADD COLUMN decisive INTEGER NOT NULL DEFAULT 1
+                """
+            )
+
+        if "threshold" not in columns:
+            cursor.execute(
+                """
+                ALTER TABLE votes
+                ADD COLUMN threshold TEXT NOT NULL DEFAULT 'majority'
+                """
+            )
+
+        if "result" not in columns:
+            cursor.execute(
+                """
+                ALTER TABLE votes
+                ADD COLUMN result TEXT
+                """
+            )
+
         self.connection.commit()
 
     @staticmethod
@@ -141,6 +138,8 @@ class Database:
         measure: str,
         title: str,
         duration_minutes: int,
+        decisive: bool,
+        threshold: str,
         opened_at: datetime,
         closes_at: datetime,
     ) -> int:
@@ -157,10 +156,12 @@ class Database:
                 measure,
                 title,
                 duration_minutes,
+                decisive,
+                threshold,
                 opened_at,
                 closes_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 guild_id,
@@ -170,6 +171,8 @@ class Database:
                 measure,
                 title,
                 duration_minutes,
+                int(decisive),
+                threshold,
                 opened_at.isoformat(),
                 closes_at.isoformat(),
             ),
@@ -395,6 +398,27 @@ class Database:
         )
 
         return list(cursor.fetchall())
+
+    def set_result(
+        self,
+        vote_id: int,
+        result: Optional[str],
+    ) -> None:
+        """Store the final result of a vote."""
+
+        self.connection.execute(
+            """
+            UPDATE votes
+            SET result = ?
+            WHERE id = ?
+            """,
+            (
+                result,
+                vote_id,
+            ),
+        )
+
+        self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()

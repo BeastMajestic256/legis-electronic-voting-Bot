@@ -18,6 +18,23 @@ VALID_VOTES = {
     "Pres",
 }
 
+VALID_THRESHOLDS = {
+    "majority",
+    "plurality",
+    "three_fifths",
+    "two_thirds",
+    "unanimity",
+}
+
+
+THRESHOLD_LABELS = {
+    "majority": "Majority",
+    "plurality": "Plurality",
+    "three_fifths": "Three-Fifths",
+    "two_thirds": "Two-Thirds",
+    "unanimity": "Unanimity",
+}
+
 
 def format_table(
     rows: list[tuple[str, str]],
@@ -70,6 +87,81 @@ def format_table(
     return "\n".join(lines)
 
 
+def evaluate_result(
+    yea: int,
+    nay: int,
+    pres: int,
+    nv: int,
+    decisive: bool,
+    threshold: str,
+) -> Optional[str]:
+    """
+    Determine whether a decisive vote passes or fails.
+
+    Yea and Nay are substantive votes.
+    Pres and NV remain recorded but do not enter the
+    substantive denominator.
+    """
+
+    if not decisive:
+        return None
+
+    if threshold not in VALID_THRESHOLDS:
+        raise ValueError(
+            f"Unknown threshold: {threshold}"
+        )
+
+    substantive_votes = yea + nay
+
+    if threshold == "majority":
+
+        return (
+            "PASSED"
+            if yea > nay
+            else "FAILED"
+        )
+
+    if threshold == "plurality":
+
+        if yea == nay:
+            return "FAILED"
+
+        return (
+            "PASSED"
+            if yea > nay
+            else "FAILED"
+        )
+
+    if substantive_votes == 0:
+        return "FAILED"
+
+    if threshold == "three_fifths":
+
+        return (
+            "PASSED"
+            if yea / substantive_votes >= 3 / 5
+            else "FAILED"
+        )
+
+    if threshold == "two_thirds":
+
+        return (
+            "PASSED"
+            if yea / substantive_votes >= 2 / 3
+            else "FAILED"
+        )
+
+    if threshold == "unanimity":
+
+        return (
+            "PASSED"
+            if yea > 0 and nay == 0
+            else "FAILED"
+        )
+
+    return "FAILED"
+
+
 class LegislativeVote:
     """Represents a legislative roll-call vote."""
 
@@ -88,6 +180,8 @@ class LegislativeVote:
         closes_at: datetime,
         creator_id: int,
         role_id: Optional[int],
+        decisive: bool,
+        threshold: str,
         closed: bool = False,
     ) -> None:
 
@@ -114,6 +208,9 @@ class LegislativeVote:
         self.closed = closed
 
         self.message: Optional[discord.Message] = None
+
+        self.decisive = decisive
+        self.threshold = threshold
 
     def get_vote(
         self,
@@ -156,6 +253,17 @@ class LegislativeVote:
         return sum(
             self.get_vote(member_id) == vote_type
             for member_id in self.voters
+        )
+
+    @property
+    def result(self) -> Optional[str]:
+        return evaluate_result(
+            yea=self.yea_count,
+            nay=self.nay_count,
+            pres=self.pres_count,
+            nv=self.nv_count,
+            decisive=self.decisive,
+            threshold=self.threshold,
         )
 
     @property
@@ -225,6 +333,16 @@ class LegislativeVote:
             else "OPEN"
         )
 
+        vote_type = (
+            "DECISIVE"
+            if self.decisive
+            else "NON-DECISIVE"
+        )
+
+        threshold = THRESHOLD_LABELS[
+            self.threshold
+        ]
+
         opened_timestamp = int(
             self.opened_at.timestamp()
         )
@@ -233,9 +351,85 @@ class LegislativeVote:
             self.closes_at.timestamp()
         )
 
+        # ---------------------------------------------------------
+        # Determine the current/final result.
+        #
+        # Decisive votes have a pass/fail result.
+        # Non-decisive votes have no result.
+        # ---------------------------------------------------------
+
+        result = None
+        result_text = None
+
+        if self.closed and self.decisive:
+            result = self.result
+            result_text = result
+
+        # ---------------------------------------------------------
+        # Description
+        # ---------------------------------------------------------
+
         description = (
             f"**{self.measure}—{self.title}**\n\n"
-            f"Status: **{status}**\n\n"
+        )
+
+        # ---------------------------------------------------------
+        # Countdown while the vote is open.
+        # This is deliberately prominent.
+        # ---------------------------------------------------------
+
+        if not self.closed:
+
+            now = datetime.now(
+                timezone.utc
+            )
+
+            remaining_seconds = max(
+                0,
+                int(
+                    (
+                        self.closes_at
+                        - now
+                    ).total_seconds()
+                ),
+            )
+
+            minutes, seconds = divmod(
+                remaining_seconds,
+                60,
+            )
+
+            countdown = (
+                f"{minutes:02d}:{seconds:02d}"
+            )
+
+            description += (
+                f"**TIME REMAINING: {countdown}**\n\n"
+            )
+
+        # ---------------------------------------------------------
+        # Basic vote information.
+        # ---------------------------------------------------------
+
+        description += (
+            f"Status: **{status}**\n"
+            f"Vote Type: **{vote_type}**\n"
+            f"Threshold: **{threshold}**\n"
+        )
+
+        # ---------------------------------------------------------
+        # Final result.
+        #
+        # Only decisive votes receive a pass/fail determination.
+        # ---------------------------------------------------------
+
+        if self.closed and self.decisive:
+            description += (
+                f"Result: **{result_text}**\n"
+            )
+
+        description += (
+            f"\n"
             f"### Vote Summary\n"
             f"```text\n"
             f"{self.build_summary_table()}\n"
@@ -243,37 +437,13 @@ class LegislativeVote:
             f"### Roll Call\n"
             f"```text\n"
             f"{self.build_roster_table()}\n"
-            f"```\n"
-            f"\n"
+            f"```\n\n"
             f"Opened: <t:{opened_timestamp}:F>\n"
         )
 
-        now = datetime.now(
-            timezone.utc
-        )
-
-        remaining_seconds = max(
-            0,
-            int(
-                (
-                    self.closes_at
-                    - now
-                ).total_seconds()
-            ),
-        )
-
-        minutes, seconds = divmod(
-            remaining_seconds,
-            60,
-        )
-
-        countdown = (
-            f"{minutes:02d}:{seconds:02d}"
-        )
-
-        description += (
-            f"Time remaining: **{countdown}**\n"
-        )
+        # ---------------------------------------------------------
+        # Show the closing timestamp.
+        # ---------------------------------------------------------
 
         if final:
             description += (
@@ -282,7 +452,11 @@ class LegislativeVote:
         else:
             description += (
                 f"Closes: <t:{closed_timestamp}:F>\n"
-        )
+            )
+
+        # ---------------------------------------------------------
+        # Electorate.
+        # ---------------------------------------------------------
 
         if self.role_id is not None:
             electorate = (
@@ -298,6 +472,10 @@ class LegislativeVote:
             f"Vote ID: **{self.vote_id}**"
         )
 
+        # ---------------------------------------------------------
+        # Create embed.
+        # ---------------------------------------------------------
+
         embed = discord.Embed(
             title=(
                 "LEGISLATIVE VOTE CLOSED"
@@ -306,6 +484,19 @@ class LegislativeVote:
             ),
             description=description,
         )
+
+        # ---------------------------------------------------------
+        # Make the final result prominent.
+        #
+        # Non-decisive votes do not receive this field.
+        # ---------------------------------------------------------
+
+        if final and self.decisive:
+            embed.add_field(
+                name="RESULT",
+                value=f"**{result}**",
+                inline=False,
+            )
 
         embed.set_footer(
             text=(
@@ -781,14 +972,14 @@ class VotingSystem:
             message_id=message.id,
             measure=row["measure"],
             title=row["title"],
-            duration_minutes=row[
-                "duration_minutes"
-            ],
+            duration_minutes=row["duration_minutes"],
             voters=voters,
             opened_at=opened_at,
             closes_at=closes_at,
             creator_id=row["creator_id"],
             role_id=row["role_id"],
+            decisive=bool(row["decisive"]),
+            threshold=row["threshold"],
             closed=False,
         )
 
@@ -1025,6 +1216,13 @@ class VotingSystem:
         # ---------------------------------------------------------
 
         vote.closed = True
+        
+        result = vote.result
+
+        self.database.set_result(
+            vote_id,
+            result,
+        )
 
         self.database.close_vote(
             vote_id
@@ -1213,6 +1411,41 @@ async def register(
     database: Database,
 ) -> VotingSystem:
 
+    decisive_choices = [
+        app_commands.Choice(
+            name="Yes",
+            value="yes",
+        ),
+        app_commands.Choice(
+            name="No",
+            value="no",
+        ),
+    ]
+
+
+    threshold_choices = [
+        app_commands.Choice(
+            name="Majority",
+            value="majority",
+        ),
+        app_commands.Choice(
+            name="Plurality",
+            value="plurality",
+        ),
+        app_commands.Choice(
+            name="Three-Fifths",
+            value="three_fifths",
+        ),
+        app_commands.Choice(
+            name="Two-Thirds",
+            value="two_thirds",
+        ),
+        app_commands.Choice(
+            name="Unanimity",
+            value="unanimity",
+        ),
+    ]
+
     voting_system = VotingSystem(
         bot,
         database,
@@ -1238,6 +1471,12 @@ async def register(
         title="The title of the measure",
         duration="Voting duration in minutes; defaults to 15",
         role="Optional role restricting who may vote",
+        decisive="Whether the vote produces a pass/fail determination",
+        threshold="The winning condition for a decisive vote",
+    )
+    @app_commands.choices(
+        decisive=decisive_choices,
+        threshold=threshold_choices,
     )
     async def legisvote_open(
         interaction: discord.Interaction,
@@ -1245,7 +1484,29 @@ async def register(
         title: str,
         duration: int = 15,
         role: Optional[discord.Role] = None,
+        decisive: str = "yes",
+        threshold: str = "majority",
     ) -> None:
+        
+        decisive_value = decisive.lower()
+
+        if decisive_value not in {"yes", "no"}:
+            await interaction.response.send_message(
+                "Invalid decisive setting.",
+                ephemeral=True,
+            )
+            return
+
+        decisive_bool = (
+            decisive_value == "yes"
+        )
+
+        if threshold not in VALID_THRESHOLDS:
+            await interaction.response.send_message(
+                "Invalid voting threshold.",
+                ephemeral=True,
+            )
+            return
 
         if interaction.guild is None:
             await interaction.response.send_message(
@@ -1336,6 +1597,8 @@ async def register(
             measure=measure,
             title=title,
             duration_minutes=duration,
+            decisive=decisive_bool,
+            threshold=threshold,
             opened_at=opened_at,
             closes_at=closes_at,
         )
@@ -1367,6 +1630,8 @@ async def register(
                 if role is not None
                 else None
             ),
+            decisive=decisive_bool,
+            threshold=threshold,
         )
 
         view = voting_system.build_view(
@@ -1444,13 +1709,45 @@ async def register(
 
         for row in votes:
 
+            threshold = THRESHOLD_LABELS.get(
+                row["threshold"],
+                row["threshold"],
+            )
+
+            vote_type = (
+                "DECISIVE"
+                if row["decisive"]
+                else "NON-DECISIVE"
+            )
+
+            # -----------------------------------------------------
+            # Only decisive votes have a result.
+            # Open decisive votes are still pending.
+            # -----------------------------------------------------
+
+            if row["decisive"]:
+                result = (
+                    row["result"]
+                    if row["result"] is not None
+                    else "PENDING"
+                )
+
+                result_line = (
+                    f"Result: **{result}**\n"
+                )
+            else:
+                result_line = ""
+
             closes_at = datetime.fromisoformat(
                 row["closes_at"]
             )
 
             lines.append(
                 f"**Vote {row['id']}** — "
-                f"{row['measure']}—{row['title']}\n"
+                f"{row['measure']}—{row['title']}\n\n"
+                f"Vote Type: **{vote_type}**\n"
+                f"Threshold: **{threshold}**\n"
+                f"{result_line}"
                 f"Closes <t:{int(closes_at.timestamp())}:R>"
             )
 
@@ -1547,6 +1844,23 @@ async def register(
                 ephemeral=True,
             )
             return
+
+        decision = (
+            "DECISIVE"
+            if row["decisive"]
+            else "NON-DECISIVE"
+        )
+
+        threshold = THRESHOLD_LABELS.get(
+            row["threshold"],
+            row["threshold"],
+        )
+
+        result = (
+            row["result"]
+            if row["result"] is not None
+            else "NO DETERMINATION"
+        )
 
         if interaction.guild is None:
             await interaction.response.send_message(
@@ -1663,6 +1977,9 @@ async def register(
         description = (
             f"**{row['measure']}—{row['title']}**\n\n"
             f"Status: **{status}**\n"
+            f"Decision: **{decision}**\n"
+            f"Threshold: **{threshold}**\n"
+            f"Result: **{result}**\n"
             f"Creator: <@{row['creator_id']}>\n"
             f"Electorate: {electorate}\n"
             f"Opened: <t:{int(opened_at.timestamp())}:F>\n"
