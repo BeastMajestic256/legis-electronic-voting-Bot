@@ -70,31 +70,39 @@ def format_table(
 
 
 class LegislativeVote:
+    """Represents a legislative roll-call vote."""
 
     def __init__(
         self,
         database: Database,
         vote_id: int,
-        interaction: discord.Interaction,
+        guild: discord.Guild,
+        channel: discord.abc.Messageable,
+        message_id: int,
         measure: str,
         title: str,
         duration_minutes: int,
-        voters: list[discord.Member],
+        voters: dict[int, discord.Member],
         opened_at: datetime,
         closes_at: datetime,
         creator_id: int,
         role_id: Optional[int],
+        closed: bool = False,
     ) -> None:
 
         self.database = database
+
         self.vote_id = vote_id
 
-        self.guild = interaction.guild
-        self.channel = interaction.channel
+        self.guild = guild
+        self.channel = channel
+        self.message_id = message_id
 
         self.measure = measure
         self.title = title
         self.duration_minutes = duration_minutes
+
+        self.voters = voters
 
         self.opened_at = opened_at
         self.closes_at = closes_at
@@ -102,19 +110,14 @@ class LegislativeVote:
         self.creator_id = creator_id
         self.role_id = role_id
 
-        self.voters = {
-            member.id: member
-            for member in voters
-        }
+        self.closed = closed
 
         self.message: Optional[discord.Message] = None
-        self.closed = False
 
     def get_vote(
         self,
         member_id: int,
     ) -> str:
-
         vote = self.database.get_voter_vote(
             self.vote_id,
             member_id,
@@ -149,7 +152,6 @@ class LegislativeVote:
         self,
         vote_type: str,
     ) -> int:
-
         return sum(
             self.get_vote(member_id) == vote_type
             for member_id in self.voters
@@ -172,22 +174,18 @@ class LegislativeVote:
         return self.count("NV")
 
     def build_summary_table(self) -> str:
-
-        rows = [
-            ("Yea", str(self.yea_count)),
-            ("Nay", str(self.nay_count)),
-            ("Pres", str(self.pres_count)),
-            ("NV", str(self.nv_count)),
-        ]
-
         return format_table(
-            rows,
+            [
+                ("Yea", str(self.yea_count)),
+                ("Nay", str(self.nay_count)),
+                ("Pres", str(self.pres_count)),
+                ("NV", str(self.nv_count)),
+            ],
             "Status",
             "Count",
         )
 
     def build_roster_table(self) -> str:
-
         rows = []
 
         sorted_members = sorted(
@@ -220,7 +218,11 @@ class LegislativeVote:
         final: bool = False,
     ) -> discord.Embed:
 
-        status = "CLOSED" if self.closed else "OPEN"
+        status = (
+            "CLOSED"
+            if self.closed
+            else "OPEN"
+        )
 
         opened_timestamp = int(
             self.opened_at.timestamp()
@@ -241,10 +243,35 @@ class LegislativeVote:
             f"```text\n"
             f"{self.build_roster_table()}\n"
             f"```\n"
+            f"\n"
+            f"Opened: <t:{opened_timestamp}:F>\n"
+        )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        remaining_seconds = max(
+            0,
+            int(
+                (
+                    self.closes_at
+                    - now
+                ).total_seconds()
+            ),
+        )
+
+        minutes, seconds = divmod(
+            remaining_seconds,
+            60,
+        )
+
+        countdown = (
+            f"{minutes:02d}:{seconds:02d}"
         )
 
         description += (
-            f"\nOpened: <t:{opened_timestamp}:F>\n"
+            f"Time remaining: **{countdown}**\n"
         )
 
         if final:
@@ -253,14 +280,17 @@ class LegislativeVote:
             )
         else:
             description += (
-                f"Closes: <t:{closed_timestamp}:R>\n"
-            )
-
-        electorate = (
-            f"<@&{self.role_id}>"
-            if self.role_id is not None
-            else "Channel-eligible Members"
+                f"Closes: <t:{closed_timestamp}:F>\n"
         )
+
+        if self.role_id is not None:
+            electorate = (
+                f"<@&{self.role_id}>"
+            )
+        else:
+            electorate = (
+                "Channel-eligible Members"
+            )
 
         description += (
             f"Electorate: {electorate}\n"
@@ -288,10 +318,12 @@ class LegislativeVote:
 
 
 class VoteButton(discord.ui.Button):
+    """Persistent button used to cast a legislative vote."""
 
     def __init__(
         self,
-        vote: LegislativeVote,
+        voting_system: "VotingSystem",
+        vote_id: int,
         vote_type: str,
         label: str,
     ) -> None:
@@ -301,12 +333,13 @@ class VoteButton(discord.ui.Button):
             style=discord.ButtonStyle.secondary,
             custom_id=(
                 f"legisvote:"
-                f"{vote.vote_id}:"
+                f"{vote_id}:"
                 f"{vote_type.lower()}"
             ),
         )
 
-        self.vote = vote
+        self.voting_system = voting_system
+        self.vote_id = vote_id
         self.vote_type = vote_type
 
     async def callback(
@@ -314,77 +347,113 @@ class VoteButton(discord.ui.Button):
         interaction: discord.Interaction,
     ) -> None:
 
-        if self.vote.closed:
+        vote = (
+            self.voting_system.active_votes.get(
+                self.vote_id
+            )
+        )
+
+        if vote is None:
+
+            await interaction.response.send_message(
+                "This vote is no longer active.",
+                ephemeral=True,
+            )
+
+            return
+
+        if vote.closed:
+
             await interaction.response.send_message(
                 "This vote is already closed.",
                 ephemeral=True,
             )
+
             return
 
-        member_id = interaction.user.id
+        member = interaction.user
 
-        if member_id not in self.vote.voters:
+        if member.id not in vote.voters:
+
             await interaction.response.send_message(
                 "You are not an eligible voter in this roll call.",
                 ephemeral=True,
             )
+
             return
 
-        old_vote = self.vote.get_vote(
-            member_id
+        old_vote = vote.get_vote(
+            member.id
         )
 
         if old_vote == self.vote_type:
+
             await interaction.response.send_message(
                 f"Your vote is already recorded as "
                 f"**{self.vote_type}**.",
                 ephemeral=True,
             )
+
             return
 
-        changed = self.vote.set_vote(
-            member_id,
+        changed = vote.set_vote(
+            member.id,
             self.vote_type,
         )
 
         if not changed:
+
             await interaction.response.send_message(
                 "Your vote could not be recorded.",
                 ephemeral=True,
             )
+
             return
 
         await interaction.response.defer()
 
-        if self.vote.message is not None:
-            await self.vote.message.edit(
-                embed=self.vote.build_embed(),
-                view=self.view,
+        if vote.message is not None:
+
+            await vote.message.edit(
+                embed=vote.build_embed(),
+                view=self.voting_system.build_view(
+                    vote
+                ),
             )
 
+        now = datetime.now(
+            timezone.utc
+        )
+
         print(
-            f"[Vote {self.vote.vote_id}] "
-            f"{interaction.user} | "
+            f"[{now.strftime('%Y-%m-%d %H:%M:%S')} UTC] "
+            f"Vote {vote.vote_id} | "
+            f"{member} | "
             f"{old_vote} -> {self.vote_type}"
         )
 
 
 class VoteView(discord.ui.View):
+    """Persistent view for a legislative vote."""
 
     def __init__(
         self,
-        vote: LegislativeVote,
+        voting_system: "VotingSystem",
+        vote_id: int,
+        disabled: bool = False,
     ) -> None:
 
         super().__init__(
             timeout=None
         )
 
-        self.vote = vote
+        self.voting_system = voting_system
+        self.vote_id = vote_id
 
         self.add_item(
             VoteButton(
-                vote,
+                voting_system,
+                vote_id,
                 "Yea",
                 "YEA",
             )
@@ -392,7 +461,8 @@ class VoteView(discord.ui.View):
 
         self.add_item(
             VoteButton(
-                vote,
+                voting_system,
+                vote_id,
                 "Nay",
                 "NAY",
             )
@@ -400,20 +470,693 @@ class VoteView(discord.ui.View):
 
         self.add_item(
             VoteButton(
-                vote,
+                voting_system,
+                vote_id,
                 "Pres",
                 "PRES",
             )
         )
 
+        if disabled:
+            self.disable_buttons()
+
     def disable_buttons(self) -> None:
 
         for item in self.children:
+
             if isinstance(
                 item,
                 discord.ui.Button,
             ):
                 item.disabled = True
+
+
+class VotingSystem:
+    """Manages active legislative votes, timers, and recovery."""
+
+    def __init__(
+        self,
+        bot: commands.Bot,
+        database: Database,
+    ) -> None:
+
+        self.bot = bot
+        self.database = database
+
+        self.active_votes: dict[
+            int,
+            LegislativeVote,
+        ] = {}
+
+        self.closing_tasks: dict[
+            int,
+            asyncio.Task,
+        ] = {}
+
+        self.countdown_tasks: dict[
+            int,
+            asyncio.Task,
+        ] = {}
+
+    def build_view(
+        self,
+        vote: LegislativeVote,
+    ) -> VoteView:
+
+        return VoteView(
+            self,
+            vote.vote_id,
+            disabled=vote.closed,
+        )
+
+    async def load_active_votes(self) -> None:
+        """Recover all open votes after a bot restart."""
+
+        rows = self.database.get_open_votes()
+
+        if not rows:
+            print(
+                "No open legislative votes to recover."
+            )
+            return
+
+        print(
+            f"Recovering {len(rows)} open legislative "
+            f"vote(s)..."
+        )
+
+        for row in rows:
+
+            vote_id = row["id"]
+
+            try:
+                await self._recover_vote(
+                    row
+                )
+
+            except Exception as exc:
+
+                print(
+                    f"[Vote {vote_id}] "
+                    f"Recovery failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    async def _recover_vote(
+        self,
+        row,
+    ) -> None:
+        """Recover one individual open vote."""
+
+        vote_id = row["id"]
+
+        # ---------------------------------------------------------
+        # Retrieve the guild.
+        # ---------------------------------------------------------
+
+        guild = self.bot.get_guild(
+            row["guild_id"]
+        )
+
+        if guild is None:
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Guild unavailable; skipping recovery."
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Retrieve the channel.
+        # ---------------------------------------------------------
+
+        channel = guild.get_channel(
+            row["channel_id"]
+        )
+
+        if channel is None:
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Channel unavailable; skipping recovery."
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Parse timestamps.
+        # ---------------------------------------------------------
+
+        opened_at = datetime.fromisoformat(
+            row["opened_at"]
+        )
+
+        closes_at = datetime.fromisoformat(
+            row["closes_at"]
+        )
+
+        remaining = (
+            closes_at
+            - datetime.now(timezone.utc)
+        ).total_seconds()
+
+        # ---------------------------------------------------------
+        # Check message ID.
+        #
+        # Older broken test votes may not have one.
+        # ---------------------------------------------------------
+
+        message_id = row["message_id"]
+
+        if message_id is None:
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Message ID is missing."
+            )
+
+            if remaining <= 0:
+
+                self.database.close_vote(
+                    vote_id
+                )
+
+                print(
+                    f"[Vote {vote_id}] "
+                    f"Expired record closed in database."
+                )
+
+            else:
+
+                print(
+                    f"[Vote {vote_id}] "
+                    f"Cannot recover because "
+                    f"message_id is missing."
+                )
+
+            return
+
+        # ---------------------------------------------------------
+        # Retrieve original message.
+        # ---------------------------------------------------------
+
+        try:
+
+            message = await channel.fetch_message(
+                message_id
+            )
+
+        except discord.NotFound:
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Recovery failed: the original message "
+                f"no longer exists."
+            )
+
+            if remaining <= 0:
+                self.database.close_vote(
+                    vote_id
+                )
+
+            return
+
+        except discord.Forbidden:
+
+            permissions = channel.permissions_for(
+                guild.me
+            )
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Recovery failed: Discord denied access "
+                f"to the original message."
+            )
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Channel permissions — "
+                f"view_channel={permissions.view_channel}, "
+                f"send_messages={permissions.send_messages}, "
+                f"read_message_history={permissions.read_message_history}"
+            )
+
+            if remaining <= 0:
+
+                self.database.close_vote(
+                    vote_id
+                )
+
+            return
+
+        except discord.HTTPException as exc:
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Discord returned an HTTP error: "
+                f"{exc}"
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Reconstruct electorate.
+        # ---------------------------------------------------------
+
+        voter_rows = self.database.get_voters(
+            vote_id
+        )
+
+        voters: dict[
+            int,
+            discord.Member,
+        ] = {}
+
+        for voter_row in voter_rows:
+
+            member_id = voter_row[
+                "member_id"
+            ]
+
+            member = guild.get_member(
+                member_id
+            )
+
+            if member is None:
+
+                try:
+
+                    member = (
+                        await guild.fetch_member(
+                            member_id
+                        )
+                    )
+
+                except discord.NotFound:
+
+                    print(
+                        f"[Vote {vote_id}] "
+                        f"Voter {member_id} "
+                        f"is no longer in the server."
+                    )
+
+                    continue
+
+            if member.bot:
+                continue
+
+            voters[member.id] = member
+
+        # ---------------------------------------------------------
+        # Reconstruct vote.
+        # ---------------------------------------------------------
+
+        vote = LegislativeVote(
+            database=self.database,
+            vote_id=vote_id,
+            guild=guild,
+            channel=channel,
+            message_id=message.id,
+            measure=row["measure"],
+            title=row["title"],
+            duration_minutes=row[
+                "duration_minutes"
+            ],
+            voters=voters,
+            opened_at=opened_at,
+            closes_at=closes_at,
+            creator_id=row["creator_id"],
+            role_id=row["role_id"],
+            closed=False,
+        )
+
+        vote.message = message
+
+        self.active_votes[
+            vote_id
+        ] = vote
+
+        # ---------------------------------------------------------
+        # If already expired, close immediately.
+        # ---------------------------------------------------------
+
+        if remaining <= 0:
+
+            print(
+                f"[Vote {vote_id}] "
+                f"Already expired; finalizing now."
+            )
+
+            await self.finish_vote(
+                vote_id
+            )
+
+            return
+
+        # ---------------------------------------------------------
+        # Restore persistent buttons.
+        # ---------------------------------------------------------
+
+        view = self.build_view(
+            vote
+        )
+
+        self.bot.add_view(
+            view,
+            message_id=message.id,
+        )
+
+        # ---------------------------------------------------------
+        # Restore closing timer.
+        # ---------------------------------------------------------
+
+        self.closing_tasks[
+            vote_id
+        ] = asyncio.create_task(
+            self.close_vote_after(
+                vote_id,
+                remaining,
+            )
+        )
+
+        # ---------------------------------------------------------
+        # Restore countdown display.
+        # ---------------------------------------------------------
+
+        self.countdown_tasks[
+            vote_id
+        ] = asyncio.create_task(
+            self.update_countdown(
+                vote_id
+            )
+        )
+
+        print(
+            f"[Vote {vote_id}] "
+            f"Recovered; "
+            f"{remaining:.0f}s remaining."
+        )
+
+    async def close_vote_after(
+        self,
+        vote_id: int,
+        seconds: float,
+    ) -> None:
+        """Wait until the scheduled closing time."""
+
+        try:
+
+            await asyncio.sleep(
+                max(
+                    0,
+                    seconds,
+                )
+            )
+
+            await self.finish_vote(
+                vote_id
+            )
+
+        except asyncio.CancelledError:
+            raise
+
+    async def update_countdown(
+        self,
+        vote_id: int,
+    ) -> None:
+        """
+        Periodically update the vote message so that the
+        displayed MM:SS countdown remains current.
+        """
+
+        try:
+
+            while True:
+
+                vote = self.active_votes.get(
+                    vote_id
+                )
+
+                if vote is None:
+                    return
+
+                if vote.closed:
+                    return
+
+                if vote.message is None:
+                    return
+
+                remaining = (
+                    vote.closes_at
+                    - datetime.now(timezone.utc)
+                ).total_seconds()
+
+                if remaining <= 0:
+                    return
+
+                try:
+
+                    await vote.message.edit(
+                        embed=vote.build_embed()
+                        ,
+                        view=self.build_view(
+                            vote
+                        ),
+                    )
+
+                except discord.NotFound:
+
+                    print(
+                        f"[Vote {vote_id}] "
+                        f"Original message disappeared "
+                        f"during countdown update."
+                    )
+
+                    return
+
+                except discord.Forbidden:
+
+                    print(
+                        f"[Vote {vote_id}] "
+                        f"Lost access during countdown update."
+                    )
+
+                    return
+
+                except discord.HTTPException as exc:
+
+                    print(
+                        f"[Vote {vote_id}] "
+                        f"Countdown update failed: "
+                        f"{exc}"
+                    )
+
+                # Normal updates every two seconds.
+                #
+                # Once the vote is nearly finished, update
+                # every second to make the clock precise.
+                if remaining <= 60:
+                    await asyncio.sleep(1)
+                else:
+                    await asyncio.sleep(2)
+
+        except asyncio.CancelledError:
+            raise
+
+    async def finish_vote(
+        self,
+        vote_id: int,
+    ) -> None:
+        """Permanently close a vote."""
+
+        vote = self.active_votes.get(
+            vote_id
+        )
+
+        # ---------------------------------------------------------
+        # The Python object may not exist, for example if an old
+        # malformed database entry is being closed manually.
+        # ---------------------------------------------------------
+
+        if vote is None:
+
+            self.database.close_vote(
+                vote_id
+            )
+
+            closing_task = (
+                self.closing_tasks.pop(
+                    vote_id,
+                    None,
+                )
+            )
+
+            if (
+                closing_task is not None
+                and not closing_task.done()
+            ):
+                closing_task.cancel()
+
+            countdown_task = (
+                self.countdown_tasks.pop(
+                    vote_id,
+                    None,
+                )
+            )
+
+            if (
+                countdown_task is not None
+                and not countdown_task.done()
+            ):
+                countdown_task.cancel()
+
+            return
+
+        if vote.closed:
+            return
+
+        # ---------------------------------------------------------
+        # Mark database closed FIRST.
+        # ---------------------------------------------------------
+
+        vote.closed = True
+
+        self.database.close_vote(
+            vote_id
+        )
+
+        # ---------------------------------------------------------
+        # Stop countdown task.
+        # ---------------------------------------------------------
+
+        countdown_task = (
+            self.countdown_tasks.pop(
+                vote_id,
+                None,
+            )
+        )
+
+        current_task = asyncio.current_task()
+
+        if (
+            countdown_task is not None
+            and countdown_task is not current_task
+            and not countdown_task.done()
+        ):
+            countdown_task.cancel()
+
+        # ---------------------------------------------------------
+        # Disable buttons and update final record.
+        # ---------------------------------------------------------
+
+        view = self.build_view(
+            vote
+        )
+
+        if vote.message is not None:
+
+            try:
+
+                await vote.message.edit(
+                    embed=vote.build_embed(
+                        final=True
+                    ),
+                    view=view,
+                )
+
+            except discord.NotFound:
+
+                print(
+                    f"[Vote {vote_id}] "
+                    f"Original message no longer exists."
+                )
+
+            except discord.Forbidden:
+
+                print(
+                    f"[Vote {vote_id}] "
+                    f"Cannot modify original message."
+                )
+
+            except discord.HTTPException as exc:
+
+                print(
+                    f"[Vote {vote_id}] "
+                    f"Failed to update final result: "
+                    f"{exc}"
+                )
+
+        self.active_votes.pop(
+            vote_id,
+            None,
+        )
+
+        closing_task = (
+            self.closing_tasks.pop(
+                vote_id,
+                None,
+            )
+        )
+
+        if (
+            closing_task is not None
+            and closing_task is not current_task
+            and not closing_task.done()
+        ):
+            closing_task.cancel()
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        print(
+            f"[{now.strftime('%Y-%m-%d %H:%M:%S')} UTC] "
+            f"Vote {vote_id} closed."
+        )
+
+    async def close_vote_manual(
+        self,
+        vote_id: int,
+    ) -> bool:
+        """
+        Manually close a vote.
+
+        Returns True if a vote was found in the database.
+        """
+
+        row = self.database.get_vote(
+            vote_id
+        )
+
+        if row is None:
+            return False
+
+        if row["closed"]:
+            return True
+
+        # If the active in-memory vote exists, use the
+        # normal finalization path.
+        if vote_id in self.active_votes:
+
+            await self.finish_vote(
+                vote_id
+            )
+
+            return True
+
+        # Otherwise this may be an old malformed or unrecovered
+        # database record. Close it safely in SQLite.
+        self.database.close_vote(
+            vote_id
+        )
+
+        print(
+            f"[Vote {vote_id}] "
+            f"Manually closed directly in database."
+        )
+
+        return True
 
 
 async def get_eligible_members(
@@ -454,59 +1197,37 @@ async def get_eligible_members(
         if role is not None and role not in member.roles:
             continue
 
-        eligible.append(member)
+        eligible.append(
+            member
+        )
 
     return eligible
-
-
-async def close_vote(
-    vote: LegislativeVote,
-    view: VoteView,
-) -> None:
-
-    await asyncio.sleep(
-        max(
-            0,
-            (
-                vote.closes_at
-                - datetime.now(timezone.utc)
-            ).total_seconds(),
-        )
-    )
-
-    if vote.closed:
-        return
-
-    vote.closed = True
-
-    vote.database.close_vote(
-        vote.vote_id
-    )
-
-    view.disable_buttons()
-
-    if vote.message is None:
-        return
-
-    await vote.message.edit(
-        embed=vote.build_embed(final=True),
-        view=view,
-    )
 
 
 async def register(
     bot: commands.Bot,
     database: Database,
-) -> None:
+) -> VotingSystem:
+
+    voting_system = VotingSystem(
+        bot,
+        database,
+    )
+
+    bot.voting_system = voting_system
 
     legis_group = app_commands.Group(
         name="legisvote",
-        description="Electronic legislative roll-call system.",
+        description=(
+            "Electronic legislative roll-call system."
+        ),
     )
 
     @legis_group.command(
         name="open",
-        description="Open an electronic legislative roll-call vote.",
+        description=(
+            "Open an electronic legislative roll-call vote."
+        ),
     )
     @app_commands.describe(
         measure="The legislative measure, e.g. S. 5",
@@ -594,7 +1315,9 @@ async def register(
 
         closes_at = (
             opened_at
-            + timedelta(minutes=duration)
+            + timedelta(
+                minutes=duration
+            )
         )
 
         vote_id = database.create_vote(
@@ -622,11 +1345,16 @@ async def register(
         vote = LegislativeVote(
             database=database,
             vote_id=vote_id,
-            interaction=interaction,
+            guild=interaction.guild,
+            channel=interaction.channel,
+            message_id=0,
             measure=measure,
             title=title,
             duration_minutes=duration,
-            voters=voters,
+            voters={
+                member.id: member
+                for member in voters
+            },
             opened_at=opened_at,
             closes_at=closes_at,
             creator_id=creator.id,
@@ -637,7 +1365,9 @@ async def register(
             ),
         )
 
-        view = VoteView(vote)
+        view = voting_system.build_view(
+            vote
+        )
 
         await interaction.response.send_message(
             embed=vote.build_embed(),
@@ -648,16 +1378,45 @@ async def register(
             await interaction.original_response()
         )
 
+        vote.message_id = vote.message.id
+
         database.set_message_id(
             vote_id,
             vote.message.id,
         )
 
-        asyncio.create_task(
-            close_vote(
-                vote,
-                view,
+        voting_system.active_votes[
+            vote_id
+        ] = vote
+
+        task = asyncio.create_task(
+            voting_system.close_vote_after(
+                vote_id,
+                duration * 60,
             )
+        )
+
+        voting_system.closing_tasks[
+            vote_id
+        ] = task
+
+        voting_system.countdown_tasks[
+            vote_id
+        ] = asyncio.create_task(
+            voting_system.update_countdown(
+                vote_id
+            )
+        )
+
+        now = datetime.now(
+            timezone.utc
+        )
+
+        print(
+            f"[{now.strftime('%Y-%m-%d %H:%M:%S')} UTC] "
+            f"Vote {vote_id} opened | "
+            f"{measure}—{title} | "
+            f"Voters: {len(voters)}"
         )
 
     @legis_group.command(
@@ -680,6 +1439,7 @@ async def register(
         lines = []
 
         for row in votes:
+
             closes_at = datetime.fromisoformat(
                 row["closes_at"]
             )
@@ -713,7 +1473,7 @@ async def register(
 
         limit = max(
             1,
-            min(limit, 25)
+            min(limit, 25),
         )
 
         votes = database.get_recent_votes(
@@ -730,6 +1490,7 @@ async def register(
         rows = []
 
         for row in votes:
+
             status = (
                 "OPEN"
                 if not row["closed"]
@@ -738,7 +1499,8 @@ async def register(
 
             rows.append(
                 (
-                    f"#{row['id']} {row['measure']}",
+                    f"#{row['id']} "
+                    f"{row['measure']}",
                     status,
                 )
             )
@@ -757,10 +1519,11 @@ async def register(
                 "```"
             )
         )
-
     @legis_group.command(
         name="record",
-        description="Show the official record of a legislative vote.",
+        description=(
+            "Show the official record of a legislative vote."
+        ),
     )
     @app_commands.describe(
         vote_id="The ID of the vote to display",
@@ -795,25 +1558,28 @@ async def register(
         roll_call_rows = []
 
         for voter_row in voter_rows:
+
             member_id = voter_row["member_id"]
 
-            member = (
-                interaction.guild.get_member(
-                    member_id
-                )
+            member = interaction.guild.get_member(
+                member_id
             )
 
             if member is None:
+
                 try:
                     member = (
                         await interaction.guild.fetch_member(
                             member_id
                         )
                     )
+
                 except discord.NotFound:
                     name = f"User {member_id}"
+
                 else:
                     name = member.display_name
+
             else:
                 name = member.display_name
 
@@ -837,15 +1603,28 @@ async def register(
         }
 
         for _, vote in roll_call_rows:
+
             if vote in summary_counts:
                 summary_counts[vote] += 1
 
         summary_table = format_table(
             [
-                ("Yea", str(summary_counts["Yea"])),
-                ("Nay", str(summary_counts["Nay"])),
-                ("Pres", str(summary_counts["Pres"])),
-                ("NV", str(summary_counts["NV"])),
+                (
+                    "Yea",
+                    str(summary_counts["Yea"]),
+                ),
+                (
+                    "Nay",
+                    str(summary_counts["Nay"]),
+                ),
+                (
+                    "Pres",
+                    str(summary_counts["Pres"]),
+                ),
+                (
+                    "NV",
+                    str(summary_counts["NV"]),
+                ),
             ],
             "Status",
             "Count",
@@ -895,7 +1674,10 @@ async def register(
         )
 
         embed = discord.Embed(
-            title=f"LEGISLATIVE VOTE RECORD #{vote_id}",
+            title=(
+                f"LEGISLATIVE VOTE RECORD "
+                f"#{vote_id}"
+            ),
             description=description,
         )
 
@@ -903,6 +1685,101 @@ async def register(
             embed=embed
         )
 
+    @legis_group.command(
+        name="close",
+        description="Manually close an open legislative vote.",
+    )
+    @app_commands.describe(
+        vote_id="The ID of the vote to close",
+    )
+    async def legisvote_close(
+        interaction: discord.Interaction,
+        vote_id: int,
+    ) -> None:
+
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "This command can only be used inside a server.",
+                ephemeral=True,
+            )
+            return
+
+        creator = interaction.user
+
+        if not isinstance(
+            creator,
+            discord.Member,
+        ):
+            await interaction.response.send_message(
+                "Unable to determine your server membership.",
+                ephemeral=True,
+            )
+            return
+
+        legislative_role = (
+            interaction.guild.get_role(
+                bot.config.LEGISLATIVE_ROLE_ID
+            )
+        )
+
+        if legislative_role is None:
+            await interaction.response.send_message(
+                "The configured Legislative role could not be found.",
+                ephemeral=True,
+            )
+            return
+
+        if legislative_role not in creator.roles:
+            await interaction.response.send_message(
+                "Only Members of the Legislative may close "
+                "a legislative vote.",
+                ephemeral=True,
+            )
+            return
+
+        row = database.get_vote(
+            vote_id
+        )
+
+        if row is None:
+            await interaction.response.send_message(
+                f"Vote {vote_id} does not exist.",
+                ephemeral=True,
+            )
+            return
+
+        if row["guild_id"] != interaction.guild.id:
+            await interaction.response.send_message(
+                "That vote does not belong to this server.",
+                ephemeral=True,
+            )
+            return
+
+        if row["closed"]:
+            await interaction.response.send_message(
+                f"Vote {vote_id} is already closed.",
+                ephemeral=True,
+            )
+            return
+
+        closed = await voting_system.close_vote_manual(
+            vote_id
+        )
+
+        if not closed:
+            await interaction.response.send_message(
+                f"Vote {vote_id} could not be closed.",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.send_message(
+            f"Vote **#{vote_id}** has been manually closed.",
+        )
+
+
     bot.tree.add_command(
         legis_group
     )
+
+    return voting_system
